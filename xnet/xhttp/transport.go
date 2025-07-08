@@ -875,6 +875,8 @@ func (d *roundRobinConnector) refreshDNSCache(ctx context.Context) {
 				panic("bad hostKey value, expected it to be a valid host:port pair with an extra ip type character at the end")
 			}
 
+			seenKey := host + hostKey[len(hostKey)-1:]
+
 			var ipNetwork string
 			switch hostKey[len(hostKey)-1] {
 			case '0':
@@ -887,7 +889,7 @@ func (d *roundRobinConnector) refreshDNSCache(ctx context.Context) {
 				panic("bad hostKey value, expected last character to be 0, 4, or 6")
 			}
 
-			if v, ok := hostToIPs[host]; ok && len(v.ipList) > 0 {
+			if v, ok := hostToIPs[seenKey]; ok && len(v.ipList) > 0 {
 				rrq.renewTargetIPs(ctx, v.resolvedAt, v.ipList)
 
 				return true
@@ -925,7 +927,7 @@ func (d *roundRobinConnector) refreshDNSCache(ctx context.Context) {
 					"host not found",
 					slog.String("host", host),
 				)
-				hostToIPs[host] = cacheEntry{resolvedAt, nil}
+				hostToIPs[seenKey] = cacheEntry{resolvedAt, nil}
 				return true
 			}
 
@@ -934,7 +936,7 @@ func (d *roundRobinConnector) refreshDNSCache(ctx context.Context) {
 				ipList[i] = rawIPs[i].String()
 			}
 
-			hostToIPs[host] = cacheEntry{resolvedAt, ipList}
+			hostToIPs[seenKey] = cacheEntry{resolvedAt, ipList}
 
 			rrq.renewTargetIPs(ctx, resolvedAt, ipList)
 
