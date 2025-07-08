@@ -144,7 +144,7 @@ func (q *roundRobinQueue) Next() (*roundRobinConn, string, bool) {
 
 		// cleanup the connection
 		{
-			ignoredErr := q.PutClose(c)
+			ignoredErr := q.putCloseNoLock(c)
 			_ = ignoredErr
 		}
 
@@ -184,6 +184,34 @@ func (q *roundRobinQueue) PutClose(conn *roundRobinConn) error {
 
 	q.ipListRWM.RLock()
 	defer q.ipListRWM.RUnlock()
+
+	i, ok := q.ipToIdx.Load(conn.ipStr)
+	if !ok {
+		return result
+	}
+
+	sema = q.ipIdxToState[i].sema
+
+	return result
+}
+
+// putCloseNoLock is the same as PutClose but does not acquire the ipListRWM lock.
+//
+// useful when the round-robin queue is already locked and the caller does not want to
+// release the lock to re-acquire again just after calling this function and avoid a deadlock.
+func (q *roundRobinQueue) putCloseNoLock(conn *roundRobinConn) error {
+	result := conn.unwrappedClose()
+
+	var sema *semaphore.Weighted
+	defer func() {
+		if sema != nil {
+			sema.Release(1)
+		}
+	}()
+
+	// the next two commented lines are the only fundamental differences here between this function and PutClose
+	// q.ipListRWM.RLock()
+	// defer q.ipListRWM.RUnlock()
 
 	i, ok := q.ipToIdx.Load(conn.ipStr)
 	if !ok {
