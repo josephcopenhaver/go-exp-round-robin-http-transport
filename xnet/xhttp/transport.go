@@ -116,13 +116,46 @@ func (q *roundRobinQueue) Next() (*roundRobinConn, string, bool) {
 		return nil, "", false
 	}
 
-	i := atomic.AddUint64(&q.nextIdx, 1) % uint64(len(q.ipIdxToState))
-	c, ok := q.ipIdxToState[i].idleConns.Get()
-	var ip string
-	if !ok {
-		ip = q.ipIdxToState[i].ip
+	var st *roundRobinIPState
+	{
+		idx := atomic.AddUint64(&q.nextIdx, 1) % uint64(len(q.ipIdxToState))
+		st = &q.ipIdxToState[idx]
 	}
-	return c, ip, ok
+	idleConns := st.idleConns
+
+	c, ok := idleConns.Get()
+	if !ok {
+		return nil, st.ip, false
+	}
+
+	for {
+		err := c.isActive()
+		if err == nil {
+			break
+		}
+
+		// TODO: debug log the issue
+
+		// TODO: short circuit the loop if the error type indicates
+		// that the connection is timed-out regardless of the the connection
+		// being connected still or not
+		//
+		// this lets the routine started by roundRobinConnector.start manage cleanup duties
+
+		// cleanup the connection
+		{
+			ignoredErr := q.PutClose(c)
+			_ = ignoredErr
+		}
+
+		// try to get the next idle connection
+		c, ok = idleConns.Get()
+		if !ok {
+			return nil, st.ip, false
+		}
+	}
+
+	return c, "", true
 }
 
 // Put places a connection back into the round-robin queue
@@ -441,7 +474,7 @@ func (c *roundRobinConn) isActive() error {
 
 func (d *roundRobinConnector) dnsDial(ctx context.Context, tlsConf *tls.Config, scheme string, hostKey, network, ipNetwork, address string, joinCharIndex int, dstIP string, dialTimeout time.Duration, retryNum uint8) (*roundRobinConn, error) {
 
-	const dnsCacheTimeout = 30 * time.Second // TODO: parameterize
+	const dnsCacheTimeout = 130 * time.Second // TODO: parameterize
 
 	isDirectIPDial := (dstIP != "" && address[:joinCharIndex] == dstIP)
 
@@ -487,7 +520,7 @@ func (d *roundRobinConnector) dnsDial(ctx context.Context, tlsConf *tls.Config, 
 				slog.String("host", address[:joinCharIndex]),
 			)
 
-			const dnsTimeout = time.Second * 10 // TODO: parameterize or state-ify
+			const dnsTimeout = 10 * time.Second // TODO: parameterize or state-ify
 
 			dnsCtx, cancel := context.WithTimeout(ctx, dnsTimeout)
 			defer cancel()
@@ -749,31 +782,35 @@ func (d *roundRobinConnector) shutdown() error {
 	return nil
 }
 
-func (rrq *roundRobinQueue) renewTargetIPs(_ context.Context, resolvedAt time.Time, ipList []net.IP) {
+func (rrq *roundRobinQueue) renewTargetIPs(_ context.Context, lastResolvedAt time.Time, ipList []string) {
 	rrq.ipListRWM.Lock()
 	defer rrq.ipListRWM.Unlock()
 
 	// add any new IPs to the round-robin queue
 	for i := range ipList {
-		ipStr := ipList[i].String()
-		if i, ok := rrq.ipToIdx.Load(ipStr); ok {
+		ip := ipList[i]
+		if i, ok := rrq.ipToIdx.Load(ip); ok {
 			// update the lastSeenInDNSRespAt value for the existing IP
 			st := &rrq.ipIdxToState[i]
-			if resolvedAt.After(st.lastSeenInDNSRespAt) {
-				st.lastSeenInDNSRespAt = resolvedAt
+			if lastResolvedAt.After(st.lastSeenInDNSRespAt) {
+				st.lastSeenInDNSRespAt = lastResolvedAt
 			}
 			continue
 		}
 
 		i := len(rrq.ipIdxToState)
-		state := roundRobinIPState{ipStr, newRRConnLifoQueue(), nil, resolvedAt}
+		state := roundRobinIPState{ip, newRRConnLifoQueue(), nil, lastResolvedAt}
 		rrq.ipIdxToState = append(rrq.ipIdxToState, state)
-		rrq.ipToIdx.Store(ipStr, i)
+		rrq.ipToIdx.Store(ip, i)
 	}
 
 	// TODO: trim off any IPs that have not been seen for the AssumeRemovedTimeout duration
 
 	// TODO: adjust nextIDX if required / ideal
+
+	if lastResolvedAt.After(rrq.lastUpdatedAt) {
+		rrq.lastUpdatedAt = lastResolvedAt
+	}
 }
 
 func (d *roundRobinConnector) refreshDNSCache(ctx context.Context) {
@@ -791,14 +828,22 @@ func (d *roundRobinConnector) refreshDNSCache(ctx context.Context) {
 
 		type cacheEntry struct {
 			resolvedAt time.Time
-			ipList     []net.IP
+			ipList     []string
 		}
 
 		hostToIPs := map[string]cacheEntry{}
 		d.rrqByHostKey.Range(func(hostKey string, rrq *roundRobinQueue) bool {
+
+			// TODO: we should only perform this operation on the rrq if there are connections
+			// established or checked out otherwise the whole queue for the ip should be removed
+			// from the map
+			//
+			// trim operations likely should happen before caches are renewed so we can remove a whole
+			// hostKey set from the connector when it is all no longer used and is "clean"
 			host, _, err := net.SplitHostPort(hostKey[:len(hostKey)-1])
 			if err != nil {
-				// should never happen, TODO: persist the raw data form in the round-robin queue so avoid a need for this call
+				// should never happen
+				// TODO: persist the raw data form in the round-robin queue so avoid a need for this call
 				panic("bad hostKey value, expected it to be a valid host:port pair with an extra ip type character at the end")
 			}
 
@@ -820,13 +865,13 @@ func (d *roundRobinConnector) refreshDNSCache(ctx context.Context) {
 				return true
 			}
 
-			const dnsTimeout = time.Second * 10 // TODO: parameterize or state-ify
+			const dnsTimeout = 10 * time.Second // TODO: parameterize or state-ify
 
 			dnsCtx, cancel := context.WithTimeout(ctx, dnsTimeout)
 			defer cancel()
 
 			resolveStartAt := time.Now()
-			ipList, err := net.DefaultResolver.LookupIP(dnsCtx, ipNetwork, host)
+			rawIPs, err := net.DefaultResolver.LookupIP(dnsCtx, ipNetwork, host)
 			resolvedAt := time.Now()
 			if err != nil {
 				slog.LogAttrs(ctx, slog.LevelError,
@@ -844,16 +889,21 @@ func (d *roundRobinConnector) refreshDNSCache(ctx context.Context) {
 				slog.String("host", host),
 				slog.Time("resolve_start_at", resolveStartAt),
 				slog.Time("resolved_at", resolvedAt),
-				slog.Int("num_ips", len(ipList)),
+				slog.Int("num_ips", len(rawIPs)),
 			)
 
-			if len(ipList) == 0 {
+			if len(rawIPs) == 0 {
 				slog.LogAttrs(ctx, slog.LevelError,
 					"host not found",
 					slog.String("host", host),
 				)
 				hostToIPs[host] = cacheEntry{resolvedAt, nil}
 				return true
+			}
+
+			ipList := make([]string, len(rawIPs))
+			for i := range rawIPs {
+				ipList[i] = rawIPs[i].String()
 			}
 
 			hostToIPs[host] = cacheEntry{resolvedAt, ipList}
@@ -911,11 +961,10 @@ func (d *roundRobinConnector) refreshDNSCache(ctx context.Context) {
 						// much guaranteed to be older than the one we just checked
 						// so we can just close the connections remaining
 						// and remove them from the queue
-						var numClosed int
+						numClosed := i + 1
 						for i := i; i >= 0; i-- {
 							conn := idleConns[i]
 							func() {
-								numClosed++
 								defer func() {
 									if r := recover(); r != nil {
 										slog.LogAttrs(ctx, slog.LevelError,
@@ -992,7 +1041,7 @@ type roundRobinTransport struct {
 // during the reading of a response body io.Reader.
 //
 // this is useful for conveying errors and the total data read up to that point
-// when connection management is fully managed by the round-robin transport
+// when connection management is fully managed by something like a round-robin transport
 type errReader struct {
 	b   []byte
 	err error
@@ -1081,9 +1130,6 @@ func contextReadAll(ctx context.Context, r io.Reader, closeNetConn func()) ([]by
 	}
 }
 
-// TODO: this always buffers the response body, which is not ideal for large responses and can be a denial of service vector
-// should the round tripper be used with untrusted endpoints in the wild, it should be used with caution or
-// exhaustively tested and proven to work securely should the original response body remain open for reading
 func (t *roundRobinTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	var conn *roundRobinConn
 	closeConn := sync.OnceFunc(func() {
