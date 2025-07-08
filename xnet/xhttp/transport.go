@@ -289,6 +289,13 @@ func (d *roundRobinConnector) GetOrCreateConnection(req *http.Request, network s
 		return nil, nil, errMaxHostnameLengthExceeded
 	}
 
+	// TODO: hostKey should not need the port in it
+	//
+	// it is there to make sure that connections are not reused across different ports
+	// but this means that dns requests are duplicated
+	//
+	// Ideally a hostkey is a key to a map of host + network type to a map of ports to round-robin queues
+
 	var ipNetwork string
 	hostKey := address
 	switch network {
