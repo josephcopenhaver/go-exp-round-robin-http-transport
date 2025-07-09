@@ -135,8 +135,13 @@ type dnsResolver interface {
 	LookupIP(ctx context.Context, network, host string) ([]net.IP, error)
 }
 
+type dialer interface {
+	DialTimeout(network, address string, timeout time.Duration) (net.Conn, error)
+}
+
 type roundRobinConnector struct {
 	resolver           dnsResolver
+	dialer             dialer
 	dnsCacheMap        xsync.Map[string, *xnet.DNSCache]
 	dnsRWM             sync.RWMutex
 	rrqByHostKeyPort   portMap
@@ -637,7 +642,7 @@ func (d *roundRobinConnector) dnsDial(ctx context.Context, tlsConf *tls.Config, 
 							slog.String("port", address[joinCharIndex+1:]),
 							slog.String("host", address[:joinCharIndex]),
 						)
-						v, err := net.DialTimeout(network, net.JoinHostPort(ip, address[joinCharIndex+1:]), dialTimeout)
+						v, err := d.dialer.DialTimeout(network, net.JoinHostPort(ip, address[joinCharIndex+1:]), dialTimeout)
 						if err == nil {
 							createdAt = time.Now()
 							slog.LogAttrs(ctx, slog.LevelDebug,
@@ -776,7 +781,7 @@ func (d *roundRobinConnector) dnsDial(ctx context.Context, tlsConf *tls.Config, 
 		ip = dstIP
 
 		ipPort := net.JoinHostPort(dstIP, address[joinCharIndex+1:])
-		c, err := net.DialTimeout(network, ipPort, dialTimeout)
+		c, err := d.dialer.DialTimeout(network, ipPort, dialTimeout)
 		if err != nil {
 			return nil, fmt.Errorf("failed to dial %s: %w", address[:joinCharIndex], err)
 		}
@@ -1331,12 +1336,36 @@ type RoundRobinTransporter interface {
 	Shutdown() error
 }
 
+type wrappedDialer struct {
+	d *net.Dialer
+}
+
+func (wd wrappedDialer) DialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
+	var d net.Dialer
+	if wd.d != nil {
+		d = *wd.d
+		d.Resolver = nil
+	}
+
+	d.Timeout = timeout
+
+	return d.Dial(network, address)
+}
+
+func newDialer() dialer {
+	return wrappedDialer{}
+}
+
 func NewRoundRobinTransport(ctx context.Context) RoundRobinTransporter {
 	// TODO: allow passing a custom resolver
 	resolver := dnsResolver(net.DefaultResolver)
 
+	// TODO: allow passing a custom dialer
+	dialer := newDialer()
+
 	connector := &roundRobinConnector{
 		resolver:         resolver,
+		dialer:           dialer,
 		dnsCacheMap:      xsync.NewMap[string, *xnet.DNSCache](),
 		rrqByHostKeyPort: newPortMap(),
 	}
