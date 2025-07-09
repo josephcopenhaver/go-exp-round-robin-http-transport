@@ -198,6 +198,10 @@ func (q *lifo[T]) Close() error {
 		return ErrQueueClosed
 	}
 
+	//
+	// TODO: use a singleflight operation here to avoid concurrent executors since they should all use the same result
+	//
+
 	q.rwmPut.RLock()
 	unlocker := q.rwmPut.RUnlock
 	defer func() {

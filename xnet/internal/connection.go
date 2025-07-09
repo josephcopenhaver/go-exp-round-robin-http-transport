@@ -47,6 +47,16 @@ var isConnectedSyscallBuf = []byte{0}
 //
 // See https://stackoverflow.com/a/58664631/3200607
 func IsConnected(conn net.Conn) (bool, error) {
+
+	// supports getting passed a *tls.Conn or similar
+	for {
+		v, ok := conn.(interface{ NetConn() net.Conn })
+		if !ok {
+			break
+		}
+		conn = v.NetConn()
+	}
+
 	sconn, ok := conn.(syscall.Conn)
 	if !ok {
 		return false, ErrNotSyscallConn
@@ -91,6 +101,16 @@ func IsConnected(conn net.Conn) (bool, error) {
 // It expects the input to implement syscall.Conn and for that implementation to not
 // return an error when calling SyscallConn for the check to be fully reliable.
 func IsConnectedNoErr(conn net.Conn) bool {
+
+	// supports getting passed a *tls.Conn or similar
+	for {
+		v, ok := conn.(interface{ NetConn() net.Conn })
+		if !ok {
+			break
+		}
+		conn = v.NetConn()
+	}
+
 	sconn, ok := conn.(syscall.Conn)
 	if !ok {
 		return false

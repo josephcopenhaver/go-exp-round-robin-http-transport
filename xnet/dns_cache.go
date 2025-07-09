@@ -39,17 +39,17 @@ func (i IPNetwork) String() string {
 }
 
 type DNSResponseRecord struct {
-	lastSeen time.Time
-	ip       string
+	LastSeen time.Time
+	IP       string
 }
 
 type DNSCache struct {
 	rwm                           sync.RWMutex
+	records                       []DNSResponseRecord
 	host                          string
 	lastRefreshedAt               time.Time
 	lastRefreshSucceededAt        time.Time
 	lastRefreshError              error
-	records                       []DNSResponseRecord
 	staleTimeout                  time.Duration
 	errStaleTimeout               time.Duration
 	recordVisibilityTimeout       time.Duration
@@ -82,7 +82,12 @@ func (c *DNSCache) needsRefresh() bool {
 	return time.Since(c.lastRefreshedAt) >= staleTimeout
 }
 
-func (c *DNSCache) Refresh(ctx context.Context, resolver dnsResolver) (bool, error) {
+func (c *DNSCache) Refresh(ctx context.Context, resolver dnsResolver) (time.Time, int, bool, error) {
+
+	//
+	// TODO: use a singleflight operation here to avoid concurrent executors since they should all use the same result
+	//
+
 	c.rwm.RLock()
 	unlocker := c.rwm.RUnlock
 	defer func() {
@@ -93,27 +98,51 @@ func (c *DNSCache) Refresh(ctx context.Context, resolver dnsResolver) (bool, err
 	}()
 
 	if !c.needsRefresh() {
-		return false, c.lastRefreshError
+		if len(c.records) == 0 {
+			if c.lastRefreshError == nil {
+				return c.lastRefreshSucceededAt, 0, false, ErrHostNotFound
+			}
+			return c.lastRefreshSucceededAt, 0, false, c.lastRefreshError
+		}
+		return c.lastRefreshSucceededAt, len(c.records), false, c.lastRefreshError
 	}
 
 	{
 		f := unlocker
 		unlocker = nil
 		f()
+
+		unlocker = c.rwm.Unlock
+		c.rwm.Lock()
 	}
-	c.rwm.Lock()
-	unlocker = c.rwm.Unlock
 
 	if !c.needsRefresh() {
-		return false, c.lastRefreshError
+		if len(c.records) == 0 {
+			if c.lastRefreshError == nil {
+				return c.lastRefreshSucceededAt, 0, false, ErrHostNotFound
+			}
+			return c.lastRefreshSucceededAt, 0, false, c.lastRefreshError
+		}
+		return c.lastRefreshSucceededAt, len(c.records), false, c.lastRefreshError
 	}
 
 	c.refresh(ctx, resolver)
 
-	return true, c.lastRefreshError
+	if len(c.records) == 0 {
+		if c.lastRefreshError == nil {
+			return c.lastRefreshSucceededAt, 0, false, ErrHostNotFound
+		}
+		return c.lastRefreshSucceededAt, 0, false, c.lastRefreshError
+	}
+
+	return c.lastRefreshSucceededAt, len(c.records), true, c.lastRefreshError
 }
 
 func (c *DNSCache) Read(ctx context.Context, resolver dnsResolver) (_records []DNSResponseRecord, _lastRefreshSuccessAt time.Time, _refreshed bool, _lastRefreshError error) {
+	//
+	// TODO: use a singleflight operation here to avoid concurrent executors since they should all use the same result
+	//
+
 	c.rwm.RLock()
 	unlocker := c.rwm.RUnlock
 	defer func() {
@@ -139,9 +168,10 @@ func (c *DNSCache) Read(ctx context.Context, resolver dnsResolver) (_records []D
 		f := unlocker
 		unlocker = nil
 		f()
+
+		unlocker = c.rwm.Unlock
+		c.rwm.Lock()
 	}
-	c.rwm.Lock()
-	unlocker = c.rwm.Unlock
 
 	if !c.needsRefresh() {
 		if len(c.records) == 0 {
@@ -198,14 +228,14 @@ func (c *DNSCache) refresh(ctx context.Context, resolver dnsResolver) {
 
 		for i := range records {
 			v := &records[i]
-			if _, ok := seenIPs[v.ip]; ok {
-				delete(seenIPs, v.ip)
-				v.lastSeen = c.lastRefreshedAt
+			if _, ok := seenIPs[v.IP]; ok {
+				delete(seenIPs, v.IP)
+				v.LastSeen = c.lastRefreshedAt
 			}
 		}
 
 		records = slices.DeleteFunc(records, func(record DNSResponseRecord) bool {
-			return c.lastRefreshedAt.Sub(record.lastSeen) >= c.recordVisibilityTimeout
+			return c.lastRefreshedAt.Sub(record.LastSeen) >= c.recordVisibilityTimeout
 		})
 
 		records = slices.Grow(records, len(seenIPs))
@@ -223,7 +253,7 @@ func (c *DNSCache) refresh(ctx context.Context, resolver dnsResolver) {
 
 	var numToRemove int
 	for i := range c.records {
-		if _, ok := seenIPs[c.records[i].ip]; !ok && c.lastRefreshedAt.Sub(c.records[i].lastSeen) >= c.recordVisibilityTimeout {
+		if _, ok := seenIPs[c.records[i].IP]; !ok && c.lastRefreshedAt.Sub(c.records[i].LastSeen) >= c.recordVisibilityTimeout {
 			numToRemove++
 		}
 	}
@@ -232,16 +262,16 @@ func (c *DNSCache) refresh(ctx context.Context, resolver dnsResolver) {
 	for i := range c.records {
 		v := &c.records[i]
 		var lastSeen time.Time
-		if _, ok := seenIPs[v.ip]; ok {
-			delete(seenIPs, v.ip)
+		if _, ok := seenIPs[v.IP]; ok {
+			delete(seenIPs, v.IP)
 			lastSeen = c.lastRefreshedAt
-		} else if c.lastRefreshedAt.Sub(v.lastSeen) >= c.recordVisibilityTimeout {
+		} else if c.lastRefreshedAt.Sub(v.LastSeen) >= c.recordVisibilityTimeout {
 			continue
 		} else {
-			lastSeen = v.lastSeen
+			lastSeen = v.LastSeen
 		}
 
-		newRecords = append(newRecords, DNSResponseRecord{lastSeen, v.ip})
+		newRecords = append(newRecords, DNSResponseRecord{lastSeen, v.IP})
 	}
 
 	for k := range seenIPs {
