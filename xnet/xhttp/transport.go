@@ -14,7 +14,6 @@ import (
 	"net"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,6 +21,7 @@ import (
 	"github.com/josephcopenhaver/go-exp-round-robin-http-transport/xnet"
 	xnet_i "github.com/josephcopenhaver/go-exp-round-robin-http-transport/xnet/internal"
 	"github.com/josephcopenhaver/go-exp-round-robin-http-transport/xqueue"
+	"github.com/josephcopenhaver/go-exp-round-robin-http-transport/xstrings"
 	"github.com/josephcopenhaver/go-exp-round-robin-http-transport/xsync"
 	"golang.org/x/sync/semaphore"
 )
@@ -320,10 +320,10 @@ func (d *roundRobinConnector) GetOrCreateConnection(req *http.Request, network s
 		portVal, portErr := strconv.ParseInt(portStr, 10, 32)
 		if splitErr != nil {
 			host = address
-			if strings.EqualFold(req.URL.Scheme, "http") {
+			if xstrings.EqualsIgnoreCaseASCII(req.URL.Scheme, "http") {
 				address = net.JoinHostPort(host, "80")
 				port = 80
-			} else if strings.EqualFold(req.URL.Scheme, "https") {
+			} else if xstrings.EqualsIgnoreCaseASCII(req.URL.Scheme, "https") {
 				address = net.JoinHostPort(host, "443")
 				port = 443
 			} else {
@@ -761,7 +761,7 @@ func (d *roundRobinConnector) dnsDial(ctx context.Context, tlsConf *tls.Config, 
 		}
 	}
 
-	isHttps := strings.EqualFold(scheme, "https")
+	isHttps := xstrings.EqualsIgnoreCaseASCII(scheme, "https")
 
 	if conn != nil {
 		goto TLS_HANDSHAKE_CHECK
@@ -1272,7 +1272,7 @@ func (t *roundRobinTransport) RoundTrip(req *http.Request) (*http.Response, erro
 		//
 		// if the request is Connection unspecified, then we assume it is keep-alive enabled as per the HTTP/1.1 spec
 
-		reqAllowsReuse := ((resp.ProtoMajor == 2 && resp.ProtoMinor == 0) || !reqConnectionSet || strings.EqualFold(reqConnection, "keep-alive"))
+		reqAllowsReuse := ((resp.ProtoMajor == 2 && resp.ProtoMinor == 0) || !reqConnectionSet || xstrings.EqualsIgnoreCaseASCII(reqConnection, "keep-alive"))
 
 		if !reqAllowsReuse {
 			return resp, nil
@@ -1304,9 +1304,9 @@ func (t *roundRobinTransport) RoundTrip(req *http.Request) (*http.Response, erro
 
 			switch resp.ProtoMinor {
 			case 0:
-				respAllowsReuse = strings.EqualFold(respConnection, "keep-alive")
+				respAllowsReuse = xstrings.EqualsIgnoreCaseASCII(respConnection, "keep-alive")
 			case 1:
-				respAllowsReuse = (!respConnectionSet || strings.EqualFold(respConnection, "keep-alive"))
+				respAllowsReuse = (!respConnectionSet || xstrings.EqualsIgnoreCaseASCII(respConnection, "keep-alive"))
 			}
 		case 2:
 			switch resp.ProtoMinor {
