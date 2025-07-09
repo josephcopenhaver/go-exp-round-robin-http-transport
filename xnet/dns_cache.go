@@ -219,7 +219,7 @@ func (c *DNSCache) refresh(ctx context.Context, resolver dnsResolver) {
 		}
 	}
 
-	if atomic.LoadInt32(&c.replaceRecords) == 0 {
+	if c.replaceRecords == 0 {
 		// no need to replace the records slice, so just going to update it in place
 		//
 		// we would need to replace it if something had read it and might be holding a reference to it
@@ -282,4 +282,5 @@ func (c *DNSCache) refresh(ctx context.Context, resolver dnsResolver) {
 	c.lastRefreshError = nil
 	c.lastRefreshSucceededAt = c.lastRefreshedAt
 	c.records = newRecords
+	c.replaceRecords = 0
 }
