@@ -941,6 +941,14 @@ func (d *roundRobinConnector) refreshDNSCache(ctx context.Context) {
 				dnsCache, _ = d.dnsCacheMap.LoadOrStore(hostKey, dnsCache)
 			}
 
+			// TODO: it's technically possible to just attempt a refresh and not taint the records
+			// slice lifetime by reading the records - we would need to have a callback on refresh
+			// that would check if the rrq last update time is older than the dnsRefreshLastSuccessfulAt
+			// time and if so then read the records into this context. That is a lot of extra complexity
+			// for a small allocation prevention during relative idle time for this connector-host-port
+			// combination. It's likely not worth implementing until tests show allocations can be saved
+			// and have a meaningful impact on the performance of the connector / runtime GC.
+
 			resolveStartAt := time.Now()
 			dnsRecords, dnsRefreshLastSuccessfulAt, _, err := dnsCache.Read(dnsCtx, d.resolver)
 			resolveEndAt := time.Now()
