@@ -93,7 +93,12 @@ type roundRobinQueue struct {
 	nextIdx       uint64
 }
 
+type dnsResolver interface {
+	LookupIP(ctx context.Context, network, host string) ([]net.IP, error)
+}
+
 type roundRobinConnector struct {
+	resolver           dnsResolver
 	dnsRWM             sync.RWMutex
 	rrqByHostKey       xsync.LockableMap[string, *roundRobinQueue]
 	wg                 sync.WaitGroup
@@ -511,6 +516,14 @@ func (d *roundRobinConnector) dnsDial(ctx context.Context, tlsConf *tls.Config, 
 
 	const dnsCacheTimeout = 130 * time.Second // TODO: parameterize
 
+	var port uint16
+	if v, err := strconv.Atoi(address[joinCharIndex+1:]); err != nil {
+		return nil, fmt.Errorf("failed to parse port from address: %w", err)
+	} else {
+		port = uint16(v)
+	}
+	_ = port // TODO: use port in the future
+
 	isDirectIPDial := (dstIP != "" && address[:joinCharIndex] == dstIP)
 
 	var conn net.Conn
@@ -561,7 +574,7 @@ func (d *roundRobinConnector) dnsDial(ctx context.Context, tlsConf *tls.Config, 
 			defer cancel()
 
 			resolveStartAt := time.Now()
-			ipList, err := net.DefaultResolver.LookupIP(dnsCtx, ipNetwork, address[:joinCharIndex])
+			ipList, err := d.resolver.LookupIP(dnsCtx, ipNetwork, address[:joinCharIndex])
 			if err != nil {
 				return fmt.Errorf("failed to resolve ip for host %s: %w", address[:joinCharIndex], err)
 			}
@@ -908,7 +921,7 @@ func (d *roundRobinConnector) refreshDNSCache(ctx context.Context) {
 			defer cancel()
 
 			resolveStartAt := time.Now()
-			rawIPs, err := net.DefaultResolver.LookupIP(dnsCtx, ipNetwork, host)
+			rawIPs, err := d.resolver.LookupIP(dnsCtx, ipNetwork, host)
 			resolvedAt := time.Now()
 			if err != nil {
 				slog.LogAttrs(ctx, slog.LevelError,
@@ -1315,7 +1328,11 @@ type RoundRobinTransporter interface {
 }
 
 func NewRoundRobinTransport(ctx context.Context) RoundRobinTransporter {
+	// TODO: allow passing a custom resolver
+	resolver := dnsResolver(net.DefaultResolver)
+
 	connector := &roundRobinConnector{
+		resolver:     resolver,
 		rrqByHostKey: xsync.NewLockableMap[string, *roundRobinQueue](),
 	}
 
