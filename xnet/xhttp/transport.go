@@ -675,6 +675,12 @@ func (d *roundRobinConnector) dnsDial(ctx context.Context, tlsConf *tls.Config, 
 			var errs []error
 			// var dnsRecordIdx int
 			{
+				// FIXME: RANDOMIZE_FIRST_CONNECTION
+				// TODO: this should be adjusted to start at a random index in the dnsRecords slice
+				// then ensure that the next index is set properly
+				//
+				// we should loop over the slice until we would end up back at the index from which
+				// we started
 				for i := range dnsRecords {
 					v := &dnsRecords[i]
 
@@ -723,6 +729,7 @@ func (d *roundRobinConnector) dnsDial(ctx context.Context, tlsConf *tls.Config, 
 				{
 					// randomly select the next index to start from
 					nextIdx := rand.Uint64()
+					// TODO: see FIXME: RANDOMIZE_FIRST_CONNECTION
 					// nextIdx := uint64(dnsRecordIdx) - 1 // this makes sure the next one is the one that was just dialed
 
 					ipIdxToState := make([]roundRobinIPState, 0, len(dnsRecords))
