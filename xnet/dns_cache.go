@@ -82,7 +82,7 @@ func (c *DNSCache) needsRefresh() bool {
 	return time.Since(c.lastRefreshedAt) >= staleTimeout
 }
 
-func (c *DNSCache) Refresh(ctx context.Context, resolver dnsResolver) (time.Time, int, bool, error) {
+func (c *DNSCache) Refresh(ctx context.Context, resolver dnsResolver, excludeIPs ...string) (time.Time, int, bool, error) {
 
 	//
 	// TODO: use a singleflight operation here to avoid concurrent executors since they should all use the same result
@@ -104,7 +104,17 @@ func (c *DNSCache) Refresh(ctx context.Context, resolver dnsResolver) (time.Time
 			}
 			return c.lastRefreshSucceededAt, 0, false, c.lastRefreshError
 		}
-		return c.lastRefreshSucceededAt, len(c.records), false, c.lastRefreshError
+
+		var excludeMatches int
+		if len(excludeIPs) > 0 {
+			for i := range c.records {
+				if slices.Contains(excludeIPs, c.records[i].IP) {
+					excludeMatches++
+				}
+			}
+		}
+
+		return c.lastRefreshSucceededAt, len(c.records) - excludeMatches, false, c.lastRefreshError
 	}
 
 	{
@@ -123,7 +133,17 @@ func (c *DNSCache) Refresh(ctx context.Context, resolver dnsResolver) (time.Time
 			}
 			return c.lastRefreshSucceededAt, 0, false, c.lastRefreshError
 		}
-		return c.lastRefreshSucceededAt, len(c.records), false, c.lastRefreshError
+
+		var excludeMatches int
+		if len(excludeIPs) > 0 {
+			for i := range c.records {
+				if slices.Contains(excludeIPs, c.records[i].IP) {
+					excludeMatches++
+				}
+			}
+		}
+
+		return c.lastRefreshSucceededAt, len(c.records) - excludeMatches, false, c.lastRefreshError
 	}
 
 	c.refresh(ctx, resolver)
@@ -135,7 +155,16 @@ func (c *DNSCache) Refresh(ctx context.Context, resolver dnsResolver) (time.Time
 		return c.lastRefreshSucceededAt, 0, false, c.lastRefreshError
 	}
 
-	return c.lastRefreshSucceededAt, len(c.records), true, c.lastRefreshError
+	var excludeMatches int
+	if len(excludeIPs) > 0 {
+		for i := range c.records {
+			if slices.Contains(excludeIPs, c.records[i].IP) {
+				excludeMatches++
+			}
+		}
+	}
+
+	return c.lastRefreshSucceededAt, len(c.records) - excludeMatches, true, c.lastRefreshError
 }
 
 func (c *DNSCache) Read(ctx context.Context, resolver dnsResolver) (_records []DNSResponseRecord, _lastRefreshSuccessAt time.Time, _refreshed bool, _lastRefreshError error) {

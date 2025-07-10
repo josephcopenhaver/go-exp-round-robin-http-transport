@@ -17,7 +17,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/josephcopenhaver/go-exp-round-robin-http-transport/xascii"
 	"github.com/josephcopenhaver/go-exp-round-robin-http-transport/xnet"
@@ -29,13 +28,15 @@ import (
 
 // maxHostnameLength is the maximum length of a hostname according to RFC 1035 and RFC 1123.
 const (
-	maxHostnameLength = 253
-)
+	maxHostnameLength      = 253
+	headerValConnKeepAlive = "keep-alive"
+	// headerValConnOWS is the set of optional whitespace characters that can be used in the Connection header value between comma separated values and before/after the possible list
+	headerValConnOWS = "\x09\x20"
+	schemeHTTP       = "http"
+	schemeHTTPS      = "https"
 
-var (
-	headerValueKeepAlive = []byte("keep-alive")
-	schemeHTTP           = []byte("http")
-	schemeHTTPS          = []byte("https")
+	msgErrDialFailed    = "dial failed"
+	prefixErrDialFailed = msgErrDialFailed + ": "
 )
 
 var (
@@ -44,7 +45,20 @@ var (
 	errIdleTimeoutExceeded       = errors.New("connection idle timeout exceeded")
 	errConnectionInactive        = errors.New("connection closed by server or client, or connection is no longer usable for reads/writes due to a network error or timeout")
 	errMaxHostnameLengthExceeded = errors.New("hostname exceeds maximum length as per RFC 1035 and RFC 1123")
+	ErrDialFailedButCanRetry     = errors.New(msgErrDialFailed)
 )
+
+type retryableDialError struct {
+	err error
+}
+
+func (e *retryableDialError) Error() string {
+	return prefixErrDialFailed + e.err.Error()
+}
+
+func (e *retryableDialError) Unwrap() []error {
+	return []error{ErrDialFailedButCanRetry, e.err}
+}
 
 // TODO: regularly expire ips that are not discovered for a timeout and close their idle connections
 //
@@ -319,7 +333,8 @@ func (d *roundRobinConnector) PutClose(c net.Conn) error {
 func (d *roundRobinConnector) GetOrCreateConnection(req *http.Request, network string, tlsConf *tls.Config) (*roundRobinConn, *http.Request, error) {
 	ctx := req.Context()
 
-	const dialTimeout = 5 * time.Second // TODO: parameterize or state-ify this
+	const getConnectionTimeout = 10 * time.Second // TODO: parameterize or state-ify this
+	const dialTimeout = 5 * time.Second           // TODO: parameterize or state-ify this
 
 	address := req.URL.Host
 	var host string
@@ -332,11 +347,10 @@ func (d *roundRobinConnector) GetOrCreateConnection(req *http.Request, network s
 			if len(req.URL.Scheme) == 0 {
 				return nil, nil, errors.New("empty scheme in request URL: expected one of http or https")
 			}
-			ibs := unsafe.Slice(unsafe.StringData(req.URL.Scheme), len(req.URL.Scheme))
-			if xascii.EqualsIgnoreCase(ibs, schemeHTTP) {
+			if xascii.EqualsIgnoreCase(req.URL.Scheme, schemeHTTP) {
 				address = net.JoinHostPort(host, "80")
 				port = 80
-			} else if xascii.EqualsIgnoreCase(ibs, schemeHTTPS) {
+			} else if xascii.EqualsIgnoreCase(req.URL.Scheme, schemeHTTPS) {
 				address = net.JoinHostPort(host, "443")
 				port = 443
 			} else {
@@ -418,10 +432,19 @@ func (d *roundRobinConnector) GetOrCreateConnection(req *http.Request, network s
 		slog.LogAttrs(ctx, slog.LevelDebug,
 			"host is empty",
 		)
+
+		dialStartTime := time.Now()
 		c, err := d.dnsDial(ctx, tlsConf, req.URL.Scheme, hostKey, network, ipNetwork, address, joinCharIndex, dstIP, dialTimeout, 0)
 		if err != nil {
+			for errors.Is(err, ErrDialFailedButCanRetry) && time.Since(dialStartTime) < getConnectionTimeout {
+				c, err = d.dnsDial(ctx, tlsConf, req.URL.Scheme, hostKey, network, ipNetwork, address, joinCharIndex, dstIP, dialTimeout, 0)
+				if err == nil {
+					return c, req, nil
+				}
+			}
 			return nil, nil, err
 		}
+
 		return c, req, nil
 	}
 
@@ -432,10 +455,19 @@ func (d *roundRobinConnector) GetOrCreateConnection(req *http.Request, network s
 			slog.String("host", host),
 			slog.String("next_strategy", "resolving name to ip via dnsDial"),
 		)
+
+		dialStartTime := time.Now()
 		c, err := d.dnsDial(ctx, tlsConf, req.URL.Scheme, hostKey, network, ipNetwork, address, joinCharIndex, dstIP, dialTimeout, 0)
 		if err != nil {
+			for errors.Is(err, ErrDialFailedButCanRetry) && time.Since(dialStartTime) < getConnectionTimeout {
+				c, err = d.dnsDial(ctx, tlsConf, req.URL.Scheme, hostKey, network, ipNetwork, address, joinCharIndex, dstIP, dialTimeout, 0)
+				if err == nil {
+					return c, req, nil
+				}
+			}
 			return nil, nil, err
 		}
+
 		return c, req, nil
 	}
 
@@ -774,10 +806,7 @@ func (d *roundRobinConnector) dnsDial(ctx context.Context, tlsConf *tls.Config, 
 		}
 	}
 
-	var isHttps bool
-	if len(scheme) > 0 {
-		isHttps = xascii.EqualsIgnoreCase(unsafe.Slice(unsafe.StringData(scheme), len(scheme)), schemeHTTPS)
-	}
+	isHttps := xascii.EqualsIgnoreCase(scheme, schemeHTTPS)
 
 	if conn != nil {
 		goto TLS_HANDSHAKE_CHECK
@@ -799,7 +828,14 @@ func (d *roundRobinConnector) dnsDial(ctx context.Context, tlsConf *tls.Config, 
 		ipPort := net.JoinHostPort(dstIP, address[joinCharIndex+1:])
 		c, err := d.dialer.DialTimeout(network, ipPort, dialTimeout)
 		if err != nil {
-			return nil, fmt.Errorf("failed to dial %s: %w", address[:joinCharIndex], err)
+			if address[:joinCharIndex] != dstIP && rrq != nil {
+				if v, ok := d.dnsCacheMap.Load(hostKey); ok {
+					if _, n, _, err := v.Refresh(ctx, d.resolver, dstIP); err == nil && n > 0 {
+						return nil, &retryableDialError{err}
+					}
+				}
+			}
+			return nil, fmt.Errorf("unsafe to retry dial: failed to dial %s: %w", address[:joinCharIndex], err)
 		}
 		createdAt = time.Now()
 		conn = c
@@ -1213,37 +1249,47 @@ func contextReadAll(ctx context.Context, r io.Reader, closeNetConn func()) ([]by
 	}
 }
 
-type parseHeaderResp struct {
+type parseHeaderResult struct {
 	Connection struct {
 		KeepAlive bool
 		NotEmpty  bool
 	}
 }
 
-func parseHeader(h http.Header) parseHeaderResp {
-	var result, resp parseHeaderResp
+// parseHeader returns data about the Connection header in the reply or response.
+//
+// it just happens to have the same implementation for both request and response headers
+// and it computes the result without allocating any memory.
+//
+// should we need different parsing logic for request and response headers in the future,
+// this can and should be split into two functions and two different result structs.
+func parseHeader(h http.Header) parseHeaderResult {
+	var result, resp parseHeaderResult
 	if h == nil {
 		return result
 	}
 
 	if v, ok := h["Connection"]; ok && len(v) > 0 {
 		resp.Connection.NotEmpty = true
+
+		ucbCutset := xascii.UnsafeConstBytes(headerValConnOWS)
+		ucbKeepAlive := xascii.UnsafeConstBytes(headerValConnKeepAlive)
+
 	KEEP_ALIVE_SEARCH:
 		for _, v := range v {
 			if len(v) == 0 {
 				continue
 			}
 
-			ibs := unsafe.Slice(unsafe.StringData(v), len(v))
-			var v []byte
-
+			ucbNext := xascii.UnsafeConstBytes(v)
+			var ucbCur []byte
 			for {
-				v, ibs = xascii.Cut(ibs, []byte{','})
-				if xascii.EqualsIgnoreCase(xascii.Trim(v, []byte{'\x09', '\x20'}), headerValueKeepAlive) {
+				ucbCur, ucbNext = xascii.CutByte(ucbNext, ',')
+				if xascii.EqualsIgnoreCase(xascii.Trim(ucbCur, ucbCutset), ucbKeepAlive) {
 					resp.Connection.KeepAlive = true
 					break KEEP_ALIVE_SEARCH
 				}
-				if len(ibs) == 0 {
+				if len(ucbNext) == 0 {
 					break
 				}
 			}
@@ -1327,7 +1373,7 @@ func (t *roundRobinTransport) RoundTrip(req *http.Request) (*http.Response, erro
 
 	// as a last step, verify that the request allows connection reuse
 	{
-		pRespHeader := parseHeader(resp.Header)
+		respH := parseHeader(resp.Header)
 
 		var respAllowsReuse bool
 		switch resp.ProtoMajor {
@@ -1339,9 +1385,9 @@ func (t *roundRobinTransport) RoundTrip(req *http.Request) (*http.Response, erro
 
 			switch resp.ProtoMinor {
 			case 0:
-				respAllowsReuse = pRespHeader.Connection.KeepAlive
+				respAllowsReuse = respH.Connection.KeepAlive
 			case 1:
-				respAllowsReuse = (!pRespHeader.Connection.NotEmpty || pRespHeader.Connection.KeepAlive)
+				respAllowsReuse = (!respH.Connection.NotEmpty || respH.Connection.KeepAlive)
 			}
 		case 2:
 			switch resp.ProtoMinor {
