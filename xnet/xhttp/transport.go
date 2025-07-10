@@ -17,17 +17,26 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
+	"github.com/josephcopenhaver/go-exp-round-robin-http-transport/xascii"
 	"github.com/josephcopenhaver/go-exp-round-robin-http-transport/xnet"
 	xnet_i "github.com/josephcopenhaver/go-exp-round-robin-http-transport/xnet/internal"
 	"github.com/josephcopenhaver/go-exp-round-robin-http-transport/xqueue"
-	"github.com/josephcopenhaver/go-exp-round-robin-http-transport/xstrings"
 	"github.com/josephcopenhaver/go-exp-round-robin-http-transport/xsync"
 	"golang.org/x/sync/semaphore"
 )
 
 // maxHostnameLength is the maximum length of a hostname according to RFC 1035 and RFC 1123.
-const maxHostnameLength = 253
+const (
+	maxHostnameLength = 253
+)
+
+var (
+	headerValueKeepAlive = []byte("keep-alive")
+	schemeHTTP           = []byte("http")
+	schemeHTTPS          = []byte("https")
+)
 
 var (
 	ErrTransportClosed           = errors.New("transport closed")
@@ -320,10 +329,14 @@ func (d *roundRobinConnector) GetOrCreateConnection(req *http.Request, network s
 		portVal, portErr := strconv.ParseInt(portStr, 10, 32)
 		if splitErr != nil {
 			host = address
-			if xstrings.EqualsIgnoreCaseASCII(req.URL.Scheme, "http") {
+			if len(req.URL.Scheme) == 0 {
+				return nil, nil, errors.New("empty scheme in request URL: expected one of http or https")
+			}
+			ibs := unsafe.Slice(unsafe.StringData(req.URL.Scheme), len(req.URL.Scheme))
+			if xascii.EqualsIgnoreCase(ibs, schemeHTTP) {
 				address = net.JoinHostPort(host, "80")
 				port = 80
-			} else if xstrings.EqualsIgnoreCaseASCII(req.URL.Scheme, "https") {
+			} else if xascii.EqualsIgnoreCase(ibs, schemeHTTPS) {
 				address = net.JoinHostPort(host, "443")
 				port = 443
 			} else {
@@ -761,7 +774,10 @@ func (d *roundRobinConnector) dnsDial(ctx context.Context, tlsConf *tls.Config, 
 		}
 	}
 
-	isHttps := xstrings.EqualsIgnoreCaseASCII(scheme, "https")
+	var isHttps bool
+	if len(scheme) > 0 {
+		isHttps = xascii.EqualsIgnoreCase(unsafe.Slice(unsafe.StringData(scheme), len(scheme)), schemeHTTPS)
+	}
 
 	if conn != nil {
 		goto TLS_HANDSHAKE_CHECK
@@ -1197,6 +1213,47 @@ func contextReadAll(ctx context.Context, r io.Reader, closeNetConn func()) ([]by
 	}
 }
 
+type parseHeaderResp struct {
+	Connection struct {
+		KeepAlive bool
+		NotEmpty  bool
+	}
+}
+
+func parseHeader(h http.Header) parseHeaderResp {
+	var result, resp parseHeaderResp
+	if h == nil {
+		return result
+	}
+
+	if v, ok := h["Connection"]; ok && len(v) > 0 {
+		resp.Connection.NotEmpty = true
+	KEEP_ALIVE_SEARCH:
+		for _, v := range v {
+			if len(v) == 0 {
+				continue
+			}
+
+			ibs := unsafe.Slice(unsafe.StringData(v), len(v))
+			var v []byte
+
+			for {
+				v, ibs = xascii.Cut(ibs, []byte{','})
+				if xascii.EqualsIgnoreCase(xascii.Trim(v, []byte{'\x09', '\x20'}), headerValueKeepAlive) {
+					resp.Connection.KeepAlive = true
+					break KEEP_ALIVE_SEARCH
+				}
+				if len(ibs) == 0 {
+					break
+				}
+			}
+		}
+	}
+
+	result = resp
+	return result
+}
+
 func (t *roundRobinTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	var conn *roundRobinConn
 	closeConn := sync.OnceFunc(func() {
@@ -1255,24 +1312,13 @@ func (t *roundRobinTransport) RoundTrip(req *http.Request) (*http.Response, erro
 
 	// verify that the request allows connection reuse
 	{
-		var reqConnection string
-		var reqConnectionSet bool
-		if v, ok := req.Header["Connection"]; ok {
-			switch len(v) {
-			case 0:
-			case 1:
-				reqConnection = v[0]
-				reqConnectionSet = true
-			default:
-				return resp, nil
-			}
-		}
+		reqH := parseHeader(req.Header)
 
 		// client always uses HTTP/1.1 or HTTP/2, so we can assume safely that if we get back a http 2.0 response the connection is reusable
 		//
 		// if the request is Connection unspecified, then we assume it is keep-alive enabled as per the HTTP/1.1 spec
 
-		reqAllowsReuse := ((resp.ProtoMajor == 2 && resp.ProtoMinor == 0) || !reqConnectionSet || xstrings.EqualsIgnoreCaseASCII(reqConnection, "keep-alive"))
+		reqAllowsReuse := ((resp.ProtoMajor == 2 && resp.ProtoMinor == 0) || !reqH.Connection.NotEmpty || reqH.Connection.KeepAlive)
 
 		if !reqAllowsReuse {
 			return resp, nil
@@ -1281,18 +1327,7 @@ func (t *roundRobinTransport) RoundTrip(req *http.Request) (*http.Response, erro
 
 	// as a last step, verify that the request allows connection reuse
 	{
-		var respConnection string
-		var respConnectionSet bool
-		if v, ok := resp.Header["Connection"]; ok {
-			switch len(v) {
-			case 0:
-			case 1:
-				respConnection = v[0]
-				respConnectionSet = true
-			default:
-				return resp, nil
-			}
-		}
+		pRespHeader := parseHeader(resp.Header)
 
 		var respAllowsReuse bool
 		switch resp.ProtoMajor {
@@ -1304,9 +1339,9 @@ func (t *roundRobinTransport) RoundTrip(req *http.Request) (*http.Response, erro
 
 			switch resp.ProtoMinor {
 			case 0:
-				respAllowsReuse = xstrings.EqualsIgnoreCaseASCII(respConnection, "keep-alive")
+				respAllowsReuse = pRespHeader.Connection.KeepAlive
 			case 1:
-				respAllowsReuse = (!respConnectionSet || xstrings.EqualsIgnoreCaseASCII(respConnection, "keep-alive"))
+				respAllowsReuse = (!pRespHeader.Connection.NotEmpty || pRespHeader.Connection.KeepAlive)
 			}
 		case 2:
 			switch resp.ProtoMinor {
