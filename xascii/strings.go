@@ -16,7 +16,7 @@ const (
 //
 // returns nil if the string is empty.
 //
-// This exists to facilitate the conversation of string types to byte slices
+// This exists to facilitate the conversion of string types to byte slices
 // without using an allocation and should be used with extreme care.
 func UnsafeConstBytes[T ~string](s T) []byte {
 	p := string(s)
