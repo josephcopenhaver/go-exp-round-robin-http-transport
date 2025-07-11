@@ -56,8 +56,12 @@ func (e *retryableDialError) Error() string {
 	return prefixErrDialFailed + e.err.Error()
 }
 
-func (e *retryableDialError) Unwrap() []error {
-	return []error{ErrDialFailedButCanRetry, e.err}
+func (e *retryableDialError) Unwrap() error {
+	return e.err
+}
+
+func (e *retryableDialError) Is(target error) bool {
+	return target == ErrDialFailedButCanRetry || errors.Is(e.err, target)
 }
 
 // TODO: regularly expire ips that are not discovered for a timeout and close their idle connections
@@ -837,7 +841,11 @@ func (d *roundRobinConnector) dnsDial(ctx context.Context, tlsConf *tls.Config, 
 		if err != nil {
 			if address[:joinCharIndex] != dstIP && rrq != nil {
 				if v, ok := d.dnsCacheMap.Load(hostKey); ok {
-					if _, n, _, err := v.Refresh(ctx, d.resolver, dstIP); err == nil && n > 0 {
+					if lastRefreshSuccessAt, n, dnsCacheJustUpdated, err := v.Refresh(ctx, d.resolver, dstIP); err == nil && n > 0 {
+						// TODO: try to refresh the rrq upstream cache if it is stale
+						// compared to the DNS cache lastRefreshSuccessAt
+						_ = lastRefreshSuccessAt
+						_ = dnsCacheJustUpdated
 						return nil, &retryableDialError{err}
 					}
 				}

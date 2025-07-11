@@ -45,6 +45,7 @@ type DNSResponseRecord struct {
 
 type DNSCache struct {
 	rwm                           sync.RWMutex
+	recordsBuf                    []DNSResponseRecord
 	records                       []DNSResponseRecord
 	host                          string
 	lastRefreshedAt               time.Time
@@ -97,62 +98,21 @@ func (c *DNSCache) Refresh(ctx context.Context, resolver dnsResolver, excludeIPs
 		}
 	}()
 
-	if !c.needsRefresh() {
-		if len(c.records) == 0 {
-			if c.lastRefreshError == nil {
-				return c.lastRefreshSucceededAt, 0, false, ErrHostNotFound
-			}
-			return c.lastRefreshSucceededAt, 0, false, c.lastRefreshError
+	var refreshed bool
+	if c.needsRefresh() {
+		{
+			f := unlocker
+			unlocker = nil
+			f()
+
+			unlocker = c.rwm.Unlock
+			c.rwm.Lock()
 		}
 
-		var excludeMatches int
-		if len(excludeIPs) > 0 {
-			for i := range c.records {
-				if slices.Contains(excludeIPs, c.records[i].IP) {
-					excludeMatches++
-				}
-			}
+		if c.needsRefresh() {
+			c.refresh(ctx, resolver)
+			refreshed = true
 		}
-
-		return c.lastRefreshSucceededAt, len(c.records) - excludeMatches, false, c.lastRefreshError
-	}
-
-	{
-		f := unlocker
-		unlocker = nil
-		f()
-
-		unlocker = c.rwm.Unlock
-		c.rwm.Lock()
-	}
-
-	if !c.needsRefresh() {
-		if len(c.records) == 0 {
-			if c.lastRefreshError == nil {
-				return c.lastRefreshSucceededAt, 0, false, ErrHostNotFound
-			}
-			return c.lastRefreshSucceededAt, 0, false, c.lastRefreshError
-		}
-
-		var excludeMatches int
-		if len(excludeIPs) > 0 {
-			for i := range c.records {
-				if slices.Contains(excludeIPs, c.records[i].IP) {
-					excludeMatches++
-				}
-			}
-		}
-
-		return c.lastRefreshSucceededAt, len(c.records) - excludeMatches, false, c.lastRefreshError
-	}
-
-	c.refresh(ctx, resolver)
-
-	if len(c.records) == 0 {
-		if c.lastRefreshError == nil {
-			return c.lastRefreshSucceededAt, 0, false, ErrHostNotFound
-		}
-		return c.lastRefreshSucceededAt, 0, false, c.lastRefreshError
 	}
 
 	var excludeMatches int
@@ -164,7 +124,7 @@ func (c *DNSCache) Refresh(ctx context.Context, resolver dnsResolver, excludeIPs
 		}
 	}
 
-	return c.lastRefreshSucceededAt, len(c.records) - excludeMatches, true, c.lastRefreshError
+	return c.lastRefreshSucceededAt, len(c.records) - excludeMatches, refreshed, c.lastRefreshError
 }
 
 func (c *DNSCache) Read(ctx context.Context, resolver dnsResolver) (_records []DNSResponseRecord, _lastRefreshSuccessAt time.Time, _refreshed bool, _lastRefreshError error) {
@@ -181,50 +141,25 @@ func (c *DNSCache) Read(ctx context.Context, resolver dnsResolver) (_records []D
 		}
 	}()
 
-	if !c.needsRefresh() {
-		if len(c.records) == 0 {
-			if c.lastRefreshError == nil {
-				return nil, c.lastRefreshSucceededAt, false, ErrHostNotFound
-			}
-			return nil, c.lastRefreshSucceededAt, false, c.lastRefreshError
-		}
-
-		atomic.StoreInt32(&c.replaceRecords, 1)
-		return c.records, c.lastRefreshSucceededAt, false, c.lastRefreshError
-	}
-
-	{
+	var refreshed bool
+	if c.needsRefresh() {
 		f := unlocker
 		unlocker = nil
 		f()
 
 		unlocker = c.rwm.Unlock
 		c.rwm.Lock()
+
+		if c.needsRefresh() {
+			c.refresh(ctx, resolver)
+			refreshed = true
+		}
 	}
 
-	if !c.needsRefresh() {
-		if len(c.records) == 0 {
-			if c.lastRefreshError == nil {
-				return nil, c.lastRefreshSucceededAt, false, ErrHostNotFound
-			}
-			return nil, c.lastRefreshSucceededAt, false, c.lastRefreshError
-		}
-
+	if c.records != nil {
 		atomic.StoreInt32(&c.replaceRecords, 1)
-		return c.records, c.lastRefreshSucceededAt, false, c.lastRefreshError
 	}
-
-	c.refresh(ctx, resolver)
-
-	if len(c.records) == 0 {
-		if c.lastRefreshError == nil {
-			return nil, c.lastRefreshSucceededAt, true, ErrHostNotFound
-		}
-		return nil, c.lastRefreshSucceededAt, true, c.lastRefreshError
-	}
-
-	atomic.StoreInt32(&c.replaceRecords, 1)
-	return c.records, c.lastRefreshSucceededAt, true, c.lastRefreshError
+	return c.records, c.lastRefreshSucceededAt, refreshed, c.lastRefreshError
 }
 
 func (c *DNSCache) refresh(ctx context.Context, resolver dnsResolver) {
@@ -253,7 +188,7 @@ func (c *DNSCache) refresh(ctx context.Context, resolver dnsResolver) {
 		//
 		// we would need to replace it if something had read it and might be holding a reference to it
 		// or a sub-slice
-		records := c.records
+		records := c.recordsBuf
 
 		for i := range records {
 			v := &records[i]
@@ -273,23 +208,29 @@ func (c *DNSCache) refresh(ctx context.Context, resolver dnsResolver) {
 		}
 
 		c.numConsecutiveRefreshFailures = 0
-		c.lastRefreshError = nil
 		c.lastRefreshSucceededAt = c.lastRefreshedAt
-		c.records = records
+		c.recordsBuf = records
+		if len(records) > 0 {
+			c.records = records
+			c.lastRefreshError = nil
+		} else {
+			c.records = nil
+			c.lastRefreshError = ErrHostNotFound
+		}
 
 		return
 	}
 
 	var numToRemove int
-	for i := range c.records {
-		if _, ok := seenIPs[c.records[i].IP]; !ok && c.lastRefreshedAt.Sub(c.records[i].LastSeen) >= c.recordVisibilityTimeout {
+	for i := range c.recordsBuf {
+		if _, ok := seenIPs[c.recordsBuf[i].IP]; !ok && c.lastRefreshedAt.Sub(c.recordsBuf[i].LastSeen) >= c.recordVisibilityTimeout {
 			numToRemove++
 		}
 	}
 
-	newRecords := make([]DNSResponseRecord, 0, len(seenIPs)+len(c.records)-numToRemove)
-	for i := range c.records {
-		v := &c.records[i]
+	newRecords := make([]DNSResponseRecord, 0, len(seenIPs)+len(c.recordsBuf)-numToRemove)
+	for i := range c.recordsBuf {
+		v := &c.recordsBuf[i]
 		var lastSeen time.Time
 		if _, ok := seenIPs[v.IP]; ok {
 			delete(seenIPs, v.IP)
@@ -308,8 +249,14 @@ func (c *DNSCache) refresh(ctx context.Context, resolver dnsResolver) {
 	}
 
 	c.numConsecutiveRefreshFailures = 0
-	c.lastRefreshError = nil
 	c.lastRefreshSucceededAt = c.lastRefreshedAt
-	c.records = newRecords
+	c.recordsBuf = newRecords
+	if len(newRecords) > 0 {
+		c.records = c.recordsBuf
+		c.lastRefreshError = nil
+	} else {
+		c.records = nil
+		c.lastRefreshError = ErrHostNotFound
+	}
 	c.replaceRecords = 0
 }

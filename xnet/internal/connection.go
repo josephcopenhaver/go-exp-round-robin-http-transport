@@ -26,8 +26,12 @@ func (e *rawConnReadError) Error() string {
 	return prefixErrRawConnReadFailed + e.err.Error()
 }
 
-func (e *rawConnReadError) Unwrap() []error {
-	return []error{ErrRawConnReadFailed, e.err}
+func (e *rawConnReadError) Unwrap() error {
+	return e.err
+}
+
+func (e *rawConnReadError) Is(target error) bool {
+	return target == ErrRawConnReadFailed || errors.Is(e.err, target)
 }
 
 var isConnectedSyscallBuf = []byte{0}
