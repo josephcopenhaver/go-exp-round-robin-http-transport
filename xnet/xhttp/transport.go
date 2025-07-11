@@ -388,11 +388,13 @@ func (d *roundRobinConnector) GetOrCreateConnection(req *http.Request, network s
 		panic("network must be one of tcp, tcp4, or tcp6")
 	}
 
-	// If the host is not an IP address, we need to ensure that the Host header is set correctly
-	// This is important for HTTP/1.1 and HTTP/2 where the Host header is required
-	if (net.ParseIP(host) == nil) && (req.Host == "" || req.Host != host) {
-		req.Host = host
-	}
+	// Note that because we resolve the hostname and connect manually,
+	// we do not need to manipulate the request req.Host nor req.URL.Host
+	// in any way.
+	//
+	// Also since we use the req.Write method everything still behaves the
+	// same as if we were using standard http.Transport in the sense that
+	// the request is sent with the correct Host header and scheme.
 
 	slog.LogAttrs(ctx, slog.LevelDebug,
 		"getting connection",
