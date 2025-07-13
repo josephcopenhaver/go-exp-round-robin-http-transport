@@ -47,7 +47,6 @@ var (
 	errMaxHostnameLengthExceeded = errors.New("hostname exceeds maximum length as per RFC 1035 and RFC 1123")
 	ErrDialFailedButCanRetry     = errors.New(msgErrDialFailed)
 	errNoHostInRequestURL        = errors.New("http: no Host in request URL")
-	errRRCacheUnstable           = errors.New("round robin cache unstable")
 )
 
 type retryableDialError struct {
@@ -434,10 +433,10 @@ func (d *roundRobinConnector) GetOrCreateConnection(req *http.Request, network s
 		)
 
 		dialStartTime := time.Now()
-		c, err := d.syncDNSAndDial(ctx, tlsConf, req.URL.Scheme, hostKey, network, ipNetwork, address, joinCharIndex, dstIP, dialTimeout)
+		c, err := d.syncDNSAndDial(ctx, tlsConf, req.URL.Scheme, hostKey, network, address, dstIP, dialTimeout, ipNetwork, joinCharIndex, port)
 		if err != nil {
 			for errors.Is(err, ErrDialFailedButCanRetry) && time.Since(dialStartTime) < getConnectionTimeout {
-				c, err = d.syncDNSAndDial(ctx, tlsConf, req.URL.Scheme, hostKey, network, ipNetwork, address, joinCharIndex, dstIP, dialTimeout)
+				c, err = d.syncDNSAndDial(ctx, tlsConf, req.URL.Scheme, hostKey, network, address, dstIP, dialTimeout, ipNetwork, joinCharIndex, port)
 				if err == nil {
 					return c, req, nil
 				}
@@ -470,11 +469,11 @@ func (d *roundRobinConnector) GetOrCreateConnection(req *http.Request, network s
 		}
 
 		host = newHost
-		address = hostKey[:len(hostKey)-1]
+		address = net.JoinHostPort(host, address[joinCharIndex+1:])
 		joinCharIndex = len(host)
 	}
 
-	c, err := d.syncDNSAndDial(ctx, tlsConf, req.URL.Scheme, hostKey, network, ipNetwork, address, joinCharIndex, host, dialTimeout)
+	c, err := d.syncDNSAndDial(ctx, tlsConf, req.URL.Scheme, hostKey, network, address, dstIP, dialTimeout, ipNetwork, joinCharIndex, port)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -570,8 +569,10 @@ func (c *roundRobinConn) isActive() error {
 	return nil
 }
 
-func (d *roundRobinConnector) directIPDial(ctx context.Context, tlsConf *tls.Config, scheme, hostKey, network string, ipNetwork xnet.IPNetwork, address string, joinCharIndex int, port uint16, dialTimeout time.Duration) (*roundRobinConn, error) {
+func (d *roundRobinConnector) directIPDial(ctx context.Context, tlsConf *tls.Config, scheme, hostKey, network string, address string, port uint16, dialTimeout time.Duration) (*roundRobinConn, error) {
 	// TODO: implement in a cleaner way since this should be much simpler than the DNS resolution and round-robin queue management
+
+	host := hostKey[:len(hostKey)-1]
 
 	if _, ok := d.rrqByHostKeyPort.load(hostKey, port); !ok {
 		// note that this approach is only safe on our memory because we do not expect
@@ -586,11 +587,17 @@ func (d *roundRobinConnector) directIPDial(ctx context.Context, tlsConf *tls.Con
 		// is allocated once and only once per hostKey and port
 		rrq := &roundRobinQueue{
 			ipToIdx:           xsync.NewMap[string, int](),
-			ipIdxToState:      []roundRobinIPState{{address[:joinCharIndex], newRRConnLifoQueue(), nil, time.Time{}}},
+			ipIdxToState:      []roundRobinIPState{{host, newRRConnLifoQueue(), nil, time.Time{}}},
 			disableDNSRefresh: true,
 		}
-		rrq.ipToIdx.Store(address[:joinCharIndex], 0)
+		rrq.ipToIdx.Store(host, 0)
 
+		// calling loadOrStore here and not utilizing results at all is intended
+		//
+		// this is to ensure that the round-robin queue is stored in the map iff
+		// it was not already present in the map
+		//
+		// so behaves more like "store-if-not-present" rather than "store-or-return-existing"
 		d.rrqByHostKeyPort.loadOrStore(hostKey, port, rrq)
 	}
 
@@ -607,7 +614,7 @@ func (d *roundRobinConnector) directIPDial(ctx context.Context, tlsConf *tls.Con
 
 	respConn := conn
 	if xascii.EqualsIgnoreCase(scheme, schemeHTTPS) {
-		v, err := tlsHandshake(ctx, tlsConf, address[:joinCharIndex], conn, 10*time.Second) // TODO: parameterize or state-ify this
+		v, err := tlsHandshake(ctx, tlsConf, host, conn, 10*time.Second) // TODO: parameterize or state-ify this
 		if err != nil {
 			return nil, fmt.Errorf("failed to perform TLS handshake: %w", err)
 		}
@@ -616,27 +623,21 @@ func (d *roundRobinConnector) directIPDial(ctx context.Context, tlsConf *tls.Con
 	br := bufio.NewReader(respConn)
 
 	conn = nil
-	return &roundRobinConn{respConn, address[:joinCharIndex], br, hostKey, port, createdAt, time.Time{}, d}, nil
+	return &roundRobinConn{respConn, host, br, hostKey, port, createdAt, time.Time{}, d}, nil
 }
 
 // TODO: add circuit breaking logic if dialing a host fails with a clear server side connection refusal or similar error
 
 // TOOD: parse port at higher level and pass it as a parameter to this dial function
 
-func (d *roundRobinConnector) syncDNSAndDial(ctx context.Context, tlsConf *tls.Config, scheme, hostKey, network string, ipNetwork xnet.IPNetwork, address string, joinCharIndex int, dstIP string, dialTimeout time.Duration) (*roundRobinConn, error) {
+func (d *roundRobinConnector) syncDNSAndDial(ctx context.Context, tlsConf *tls.Config, scheme, hostKey, network, address, dstIP string, dialTimeout time.Duration, ipNetwork xnet.IPNetwork, joinCharIndex int, port uint16) (*roundRobinConn, error) {
 
 	// const rrCacheTimeout = 130 * time.Second     // TODO: parameterize
 	const tlsHandshakeTimeout = 10 * time.Second // TODO: parameterize or state-ify this
+	host := hostKey[:len(hostKey)-1]
 
-	var port uint16
-	if v, err := strconv.Atoi(address[joinCharIndex+1:]); err != nil {
-		return nil, fmt.Errorf("failed to parse port from address: %w", err)
-	} else {
-		port = uint16(v)
-	}
-
-	if isDirectIPDial := (dstIP != "" && address[:joinCharIndex] == dstIP); isDirectIPDial {
-		return d.directIPDial(ctx, tlsConf, scheme, hostKey, network, ipNetwork, address, joinCharIndex, port, dialTimeout)
+	if isDirectIPDial := (dstIP != "" && host == dstIP); isDirectIPDial {
+		return d.directIPDial(ctx, tlsConf, scheme, hostKey, network, address, port, dialTimeout)
 	}
 
 	if dstIP != "" {
@@ -671,7 +672,7 @@ func (d *roundRobinConnector) syncDNSAndDial(ctx context.Context, tlsConf *tls.C
 
 		respConn := conn
 		if xascii.EqualsIgnoreCase(scheme, schemeHTTPS) {
-			v, err := tlsHandshake(ctx, tlsConf, address[:joinCharIndex], conn, tlsHandshakeTimeout)
+			v, err := tlsHandshake(ctx, tlsConf, host, conn, tlsHandshakeTimeout)
 			if err != nil {
 				return nil, err
 			}
@@ -686,7 +687,7 @@ func (d *roundRobinConnector) syncDNSAndDial(ctx context.Context, tlsConf *tls.C
 
 	dnsCache, ok := d.dnsCacheMap.Load(hostKey)
 	if !ok {
-		dnsCache = xnet.NewDNSCache(address[:joinCharIndex], 130*time.Second, 15*time.Second, ipNetwork)
+		dnsCache = xnet.NewDNSCache(host, 130*time.Second, 15*time.Second, ipNetwork)
 		dnsCache, _ = d.dnsCacheMap.LoadOrStore(hostKey, dnsCache)
 	}
 
@@ -732,7 +733,7 @@ func (d *roundRobinConnector) syncDNSAndDial(ctx context.Context, tlsConf *tls.C
 		panic("algorithm error: would have created an infinite loop")
 	}
 
-	return d.syncDNSAndDial(ctx, tlsConf, scheme, hostKey, network, ipNetwork, address, joinCharIndex, dstIP, dialTimeout)
+	return d.syncDNSAndDial(ctx, tlsConf, scheme, hostKey, network, address, dstIP, dialTimeout, ipNetwork, joinCharIndex, port)
 }
 
 func tlsHandshake(ctx context.Context, tlsConf *tls.Config, serverName string, conn net.Conn, timeout time.Duration) (net.Conn, error) {
@@ -831,6 +832,7 @@ func (rrq *roundRobinQueue) loadInitialDNSRecords(dnsRefreshLastSuccessfulAt tim
 	rrq.lastUpdatedAt = dnsRefreshLastSuccessfulAt
 }
 
+// refreshCacheLayers is a repeating async operation that refreshes the DNS cache layers
 func (d *roundRobinConnector) refreshCacheLayers(ctx context.Context) {
 	// TODO: for each hostKey in the cache, we should re-resolve the DNS values
 	// and update the round-robin queue with any new IPs
@@ -862,20 +864,6 @@ func (d *roundRobinConnector) refreshCacheLayers(ctx context.Context) {
 				return true
 			}
 
-			host := hostKey[:len(hostKey)-1]
-
-			var ipNetwork xnet.IPNetwork
-			switch hostKey[len(hostKey)-1] {
-			case '0':
-				ipNetwork = xnet.IPNetworkUnified
-			case '4':
-				ipNetwork = xnet.IPNetworkV4
-			case '6':
-				ipNetwork = xnet.IPNetworkV6
-			default:
-				panic("bad hostKey value, expected last character to be 0, 4, or 6")
-			}
-
 			const dnsTimeout = 10 * time.Second // TODO: parameterize or state-ify
 
 			dnsCtx, cancel := context.WithTimeout(ctx, dnsTimeout)
@@ -883,9 +871,20 @@ func (d *roundRobinConnector) refreshCacheLayers(ctx context.Context) {
 
 			dnsCache, ok := d.dnsCacheMap.Load(hostKey)
 			if !ok {
-				dnsCache = xnet.NewDNSCache(host, 130*time.Second, 15*time.Second, ipNetwork)
-				dnsCache, _ = d.dnsCacheMap.LoadOrStore(hostKey, dnsCache)
+				// This would mean that the hostname was never resolved and no request has been made
+				// to the hostKey's host before - or that the dns record was purposefully removed
+				// probably due to a visibility timeout or removal policy or a consistent inability
+				// to resolve the hostKey's hostname to any IPs.
+				//
+				// lets not attempt to resolve the hostKey's hostname if nothing is trying to connect
+				// to it anymore or it is now never resolving to any IPs.
+
+				return true
 			}
+
+			// TODO: if the ip cache for this hostkey has had no "recent read requests" - likely if not
+			// since the last two consecutive refreshes, then we can skip the DNS resolution until that
+			// changes.
 
 			// TODO: it's technically possible to just attempt a refresh and not taint the records
 			// slice lifetime by reading the records - we would need to have a callback on refresh
@@ -902,7 +901,7 @@ func (d *roundRobinConnector) refreshCacheLayers(ctx context.Context) {
 			if err != nil {
 				slog.LogAttrs(ctx, slog.LevelError,
 					"refreshCacheLayers: failed to resolve ip for host",
-					slog.String("host", host),
+					slog.String("hostKey", hostKey),
 					slog.Time("resolve_start_at", resolveStartAt),
 					slog.Time("resolve_end_at", resolveEndAt),
 					slog.String("resolve_duration", resolveEndAt.Sub(resolveStartAt).String()),
@@ -914,7 +913,7 @@ func (d *roundRobinConnector) refreshCacheLayers(ctx context.Context) {
 
 			slog.LogAttrs(ctx, slog.LevelDebug,
 				"refreshCacheLayers: got dns response",
-				slog.String("host", host),
+				slog.String("hostKey", hostKey),
 				slog.Time("resolve_start_at", resolveStartAt),
 				slog.Time("resolve_end_at", resolveEndAt),
 				slog.String("resolve_duration", resolveEndAt.Sub(resolveStartAt).String()),
