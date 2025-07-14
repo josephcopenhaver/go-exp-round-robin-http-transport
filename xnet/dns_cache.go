@@ -44,6 +44,9 @@ type DNSResponseRecord struct {
 }
 
 type DNSCache struct {
+	lastNonAsyncReadRWM sync.RWMutex
+	lastNonAsyncRead    time.Time
+
 	rwm                           sync.RWMutex
 	recordsBuf                    []DNSResponseRecord
 	records                       []DNSResponseRecord
@@ -83,7 +86,11 @@ func (c *DNSCache) needsRefresh() bool {
 	return time.Since(c.lastRefreshedAt) >= staleTimeout
 }
 
-func (c *DNSCache) Refresh(ctx context.Context, resolver dnsResolver, excludeIPs ...string) (time.Time, int, bool, error) {
+func (c *DNSCache) Refresh(ctx context.Context, resolver dnsResolver, options ...DNSRefreshOption) (time.Time, int, bool, error) {
+	var cfg dnsRefreshConfig
+	for _, f := range options {
+		f(&cfg)
+	}
 
 	//
 	// TODO: use a singleflight operation here to avoid concurrent executors since they should all use the same result
@@ -116,9 +123,9 @@ func (c *DNSCache) Refresh(ctx context.Context, resolver dnsResolver, excludeIPs
 	}
 
 	var excludeMatches int
-	if len(excludeIPs) > 0 {
+	if len(cfg.excludeIPs) > 0 {
 		for i := range c.records {
-			if slices.Contains(excludeIPs, c.records[i].IP) {
+			if slices.Contains(cfg.excludeIPs, c.records[i].IP) {
 				excludeMatches++
 			}
 		}
@@ -127,10 +134,40 @@ func (c *DNSCache) Refresh(ctx context.Context, resolver dnsResolver, excludeIPs
 	return c.lastRefreshSucceededAt, len(c.records) - excludeMatches, refreshed, c.lastRefreshError
 }
 
-func (c *DNSCache) Read(ctx context.Context, resolver dnsResolver) (_records []DNSResponseRecord, _lastRefreshSuccessAt time.Time, _refreshed bool, _lastRefreshError error) {
+func (c *DNSCache) LastNonAsyncReadTime() time.Time {
+	c.lastNonAsyncReadRWM.RLock()
+	defer c.lastNonAsyncReadRWM.RUnlock()
+
+	return c.lastNonAsyncRead
+}
+
+func (c *DNSCache) Read(ctx context.Context, resolver dnsResolver, options ...DNSReadOption) (_records []DNSResponseRecord, _lastRefreshSuccessAt time.Time, _refreshed bool, _lastRefreshError error) {
+	var cfg dnsReadConfig
+	for _, f := range options {
+		f(&cfg)
+	}
+
 	//
 	// TODO: use a singleflight operation here to avoid concurrent executors since they should all use the same result
 	//
+
+	var refreshed bool
+	var lastRefreshedAt time.Time
+
+	if !cfg.isAsync {
+		defer func() {
+			c.lastNonAsyncReadRWM.Lock()
+			defer c.lastNonAsyncReadRWM.Unlock()
+
+			if !refreshed {
+				lastRefreshedAt = time.Now()
+			}
+
+			if c.lastNonAsyncRead.IsZero() || c.lastNonAsyncRead.Before(lastRefreshedAt) {
+				c.lastNonAsyncRead = lastRefreshedAt
+			}
+		}()
+	}
 
 	c.rwm.RLock()
 	unlocker := c.rwm.RUnlock
@@ -141,7 +178,6 @@ func (c *DNSCache) Read(ctx context.Context, resolver dnsResolver) (_records []D
 		}
 	}()
 
-	var refreshed bool
 	if c.needsRefresh() {
 		f := unlocker
 		unlocker = nil
@@ -153,6 +189,7 @@ func (c *DNSCache) Read(ctx context.Context, resolver dnsResolver) (_records []D
 		if c.needsRefresh() {
 			c.refresh(ctx, resolver)
 			refreshed = true
+			lastRefreshedAt = c.lastRefreshedAt
 		}
 	}
 

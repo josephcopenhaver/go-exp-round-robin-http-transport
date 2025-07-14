@@ -646,7 +646,7 @@ func (d *roundRobinConnector) syncDNSAndDial(ctx context.Context, tlsConf *tls.C
 		createdAt := time.Now()
 		if err != nil {
 			if dnsCache, ok := d.dnsCacheMap.Load(hostKey); ok {
-				if dnsRefreshLastSuccessfulAt, n, dnsRefreshed, _ := dnsCache.Refresh(ctx, d.resolver, dstIP); n > 0 {
+				if dnsRefreshLastSuccessfulAt, n, dnsRefreshed, _ := dnsCache.Refresh(ctx, d.resolver, xnet.DNSRefreshOpts().ExcludeIPs(dstIP)); n > 0 {
 					_ = dnsRefreshLastSuccessfulAt
 					_ = dnsRefreshed
 					// TODO: we should likely update the round-robin queue with the new IPs here if the refresh was successful or
@@ -833,7 +833,7 @@ func (rrq *roundRobinQueue) loadInitialDNSRecords(dnsRefreshLastSuccessfulAt tim
 }
 
 // refreshCacheLayers is a repeating async operation that refreshes the DNS cache layers
-func (d *roundRobinConnector) refreshCacheLayers(ctx context.Context) {
+func (d *roundRobinConnector) refreshCacheLayers(ctx context.Context, dnsCacheInactiveTimeout time.Duration) {
 	// TODO: for each hostKey in the cache, we should re-resolve the DNS values
 	// and update the round-robin queue with any new IPs
 	//
@@ -882,9 +882,13 @@ func (d *roundRobinConnector) refreshCacheLayers(ctx context.Context) {
 				return true
 			}
 
-			// TODO: if the ip cache for this hostkey has had no "recent read requests" - likely if not
-			// since the last two consecutive refreshes, then we can skip the DNS resolution until that
+			// If the ip cache for this hostkey has had no "recent read requests" - likely if not
+			// since the last two consecutive async refreshes, then we can skip the DNS resolution until that
 			// changes.
+
+			if t := dnsCache.LastNonAsyncReadTime(); t.IsZero() || time.Since(t) >= dnsCacheInactiveTimeout {
+				return true
+			}
 
 			// TODO: it's technically possible to just attempt a refresh and not taint the records
 			// slice lifetime by reading the records - we would need to have a callback on refresh
@@ -895,7 +899,7 @@ func (d *roundRobinConnector) refreshCacheLayers(ctx context.Context) {
 			// and have a meaningful impact on the performance of the connector / runtime GC.
 
 			resolveStartAt := time.Now()
-			dnsRecords, dnsRefreshLastSuccessfulAt, _, err := dnsCache.Read(dnsCtx, d.resolver)
+			dnsRecords, dnsRefreshLastSuccessfulAt, _, err := dnsCache.Read(dnsCtx, d.resolver, xnet.DNSReadOpts().ForAsyncOperation(true))
 			resolveEndAt := time.Now()
 			seenCache[hostKey] = refreshRecord{dnsRecords, dnsRefreshLastSuccessfulAt, err == nil}
 			if err != nil {
@@ -1017,6 +1021,8 @@ func (d *roundRobinConnector) start(ctx context.Context, refreshInterval time.Du
 	ctx, d.stop = context.WithCancel(ctx)
 	ctxDone := ctx.Done()
 
+	dnsCacheInactiveTimeout := refreshInterval*2 + 30*time.Second
+
 	tmr := time.NewTicker(refreshInterval)
 	d.wg.Add(1)
 	go func() {
@@ -1037,7 +1043,7 @@ func (d *roundRobinConnector) start(ctx context.Context, refreshInterval time.Du
 			case <-tmr.C:
 			}
 
-			d.refreshCacheLayers(ctx)
+			d.refreshCacheLayers(ctx, dnsCacheInactiveTimeout)
 		}
 	}()
 }
