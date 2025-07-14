@@ -616,7 +616,7 @@ func (d *roundRobinConnector) directIPDial(ctx context.Context, tlsConf *tls.Con
 	if xascii.EqualsIgnoreCase(scheme, schemeHTTPS) {
 		v, err := tlsHandshake(ctx, tlsConf, host, conn, 10*time.Second) // TODO: parameterize or state-ify this
 		if err != nil {
-			return nil, fmt.Errorf("failed to perform TLS handshake: %w", err)
+			return nil, fmt.Errorf("failed to perform TLS handshake in direct-IP mode: %w", err)
 		}
 		conn = v
 	}
@@ -674,7 +674,7 @@ func (d *roundRobinConnector) syncDNSAndDial(ctx context.Context, tlsConf *tls.C
 		if xascii.EqualsIgnoreCase(scheme, schemeHTTPS) {
 			v, err := tlsHandshake(ctx, tlsConf, host, conn, tlsHandshakeTimeout)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("failed to perform TLS handshake: %w", err)
 			}
 
 			respConn = v
@@ -746,11 +746,12 @@ func (d *roundRobinConnector) syncDNSAndDial(ctx context.Context, tlsConf *tls.C
 
 func tlsHandshake(ctx context.Context, tlsConf *tls.Config, serverName string, conn net.Conn, timeout time.Duration) (net.Conn, error) {
 	if tlsConf == nil {
-		tlsConf = &tls.Config{
-			ServerName: serverName,
-			RootCAs:    nil,
-		}
+		tlsConf = &tls.Config{ServerName: serverName}
+	} else {
+		tlsConf = tlsConf.Clone()
+		tlsConf.ServerName = serverName
 	}
+
 	tlsConn := tls.Client(conn, tlsConf)
 
 	tlsHandshakeCtx, cancel := context.WithTimeout(ctx, timeout)
