@@ -685,6 +685,10 @@ func (d *roundRobinConnector) syncDNSAndDial(ctx context.Context, tlsConf *tls.C
 		return &roundRobinConn{respConn, dstIP, br, hostKey, port, createdAt, time.Time{}, d}, nil
 	}
 
+	//
+	// determining the destination IP address to dial
+	//
+
 	dnsCache, ok := d.dnsCacheMap.Load(hostKey)
 	if !ok {
 		dnsCache = xnet.NewDNSCache(host, 130*time.Second, 15*time.Second, ipNetwork)
@@ -692,7 +696,11 @@ func (d *roundRobinConnector) syncDNSAndDial(ctx context.Context, tlsConf *tls.C
 	}
 
 	dnsRecords, dnsRefreshLastSuccessfulAt, _, dnsLookupErr := dnsCache.Read(ctx, d.resolver)
-	if dnsLookupErr != nil && dnsRefreshLastSuccessfulAt.IsZero() {
+	if dnsLookupErr != nil && (dnsRefreshLastSuccessfulAt.IsZero() || len(dnsRecords) == 0) {
+		// something is up with the DNS resolver or the DNS cache
+		// and there is no last successful DNS refresh time or no DNS records
+		//
+		// so there is not connection attempt possible and no retry possible
 		return nil, dnsLookupErr
 	}
 
@@ -745,8 +753,7 @@ func tlsHandshake(ctx context.Context, tlsConf *tls.Config, serverName string, c
 	}
 	tlsConn := tls.Client(conn, tlsConf)
 
-	tlsHandshakeTimeout := 10 * time.Second // TODO: parameterize or state-ify this
-	tlsHandshakeCtx, cancel := context.WithTimeout(ctx, tlsHandshakeTimeout)
+	tlsHandshakeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	if err := tlsConn.HandshakeContext(tlsHandshakeCtx); err != nil {
