@@ -200,15 +200,10 @@ func (q *roundRobinQueue) Next() (*roundRobinConn, string, bool) {
 	}
 	idleConns := st.idleConns
 
-	c, ok := idleConns.Get()
-	if !ok {
-		return nil, st.ip, false
-	}
-
 	for {
-		err := c.isActive()
-		if err == nil {
-			break
+		c, ok := idleConns.Get()
+		if !ok {
+			return nil, st.ip, false
 		}
 
 		// TODO: debug log the issue
@@ -219,20 +214,27 @@ func (q *roundRobinQueue) Next() (*roundRobinConn, string, bool) {
 		//
 		// this lets the routine started by roundRobinConnector.start manage cleanup duties
 
-		// cleanup the connection
-		{
+		// if the connection is not active, then close it and try the next one
+		if err := c.isActive(); err != nil {
+			// cleans up the connection
 			ignoredErr := q.putCloseNoLock(c)
 			_ = ignoredErr
+
+			continue
 		}
 
-		// try to get the next idle connection
-		c, ok = idleConns.Get()
-		if !ok {
-			return nil, st.ip, false
+		// if the socket deadlines cannot be reset to system defaults, then close it and try the next one
+		if err := c.SetDeadline(time.Time{}); err != nil {
+			// cleans up the connection
+			ignoredErr := q.putCloseNoLock(c)
+			_ = ignoredErr
+
+			continue
 		}
+
+		// ladies and gentlemen, we have a winner!
+		return c, "", true
 	}
-
-	return c, "", true
 }
 
 // Put places a connection back into the round-robin queue
@@ -242,6 +244,22 @@ func (q *roundRobinQueue) Put(conn *roundRobinConn) bool {
 
 	i, ok := q.ipToIdx.Load(conn.ipStr)
 	if !ok {
+		return false
+	}
+
+	// TODO: understand ideal relationship between idle timeout and socket configs
+	//
+	// There is some relationship between the idle timeout and the socket read/write deadlines
+	// where we really, really want one to be within or exceed the other.
+	var idleDeadline time.Time
+	if d := conn.dialer.maxConnIdleTimeout; d != 0 {
+		// should actually have a buffer of dialTimeout and 1 second if the connection was never written to or read from
+		// the 1 second buffer is to ensure that the connection is not closed immediately after being checked out
+		// from the pool going from idle to active-pending states
+		idleDeadline = conn.lastIdleAt.Add(d + 1*time.Second)
+	}
+	if err := conn.SetDeadline(idleDeadline); err != nil {
+		// TODO: log the error
 		return false
 	}
 
@@ -541,11 +559,9 @@ func (c *roundRobinConn) unwrappedClose() error {
 // been idle for longer than the configured idle timeout, or the connection
 // has existed for longer than the configured connection max lifespan.
 func (c *roundRobinConn) isActive() error {
-	ok, err := xnet_i.IsConnected(c._netConn)
-	if err != nil {
-		return fmt.Errorf("failed to check if connection is active: %w", err)
-	}
 
+	// if you need to debug anything, use IsConnected instead of IsConnectedNoErr
+	ok := xnet_i.IsConnectedNoErr(c._netConn)
 	if !ok {
 		return errConnectionInactive
 	}
@@ -567,6 +583,10 @@ func (c *roundRobinConn) isActive() error {
 	}
 
 	return nil
+}
+
+type keepAliveObserver interface {
+	SetKeepAliveConfig(config net.KeepAliveConfig) error
 }
 
 func (d *roundRobinConnector) directIPDial(ctx context.Context, tlsConf *tls.Config, scheme, hostKey, network string, address string, port uint16, dialTimeout time.Duration) (*roundRobinConn, error) {
@@ -612,6 +632,43 @@ func (d *roundRobinConnector) directIPDial(ctx context.Context, tlsConf *tls.Con
 		}
 	}()
 
+	if c, ok := conn.(keepAliveObserver); ok {
+
+		// TODO: If the Deadlines need to be set differently than the system defaults,
+		// it can and should be done here on connection creation - right now they do not.
+
+		err := c.SetKeepAliveConfig(net.KeepAliveConfig{
+			// If Enable is true, keep-alive probes are enabled.
+			Enable: true,
+
+			// Idle is the time that the connection must be idle before
+			// the first keep-alive probe is sent.
+			// If zero, a default value of 15 seconds is used.
+			//
+			// recommend 30–60s to detect dead peer in a minute or less
+			Idle: 30 * time.Second,
+
+			// Interval is the time between keep-alive probes.
+			// If zero, a default value of 15 seconds is used.
+			//
+			// recommend 5–10s to detect dead peer in a minute or less
+			// and retry keepalive frequently
+			Interval: 5 * time.Second,
+
+			// Count is the maximum number of keep-alive probes that
+			// can go unanswered before dropping a connection.
+			// If zero, a default value of 9 is used.
+			//
+			// recommended 3–5 to fail fast but tolerate some packet loss
+			Count: 3,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to set keep-alive config on connection: %w", err)
+		}
+	} else {
+		return nil, fmt.Errorf("connection does not support SetKeepAliveConfig: %T", conn)
+	}
+
 	respConn := conn
 	if xascii.EqualsIgnoreCase(scheme, schemeHTTPS) {
 		v, err := tlsHandshake(ctx, tlsConf, host, conn, 10*time.Second) // TODO: parameterize or state-ify this
@@ -636,11 +693,12 @@ func (d *roundRobinConnector) syncDNSAndDial(ctx context.Context, tlsConf *tls.C
 	const tlsHandshakeTimeout = 10 * time.Second // TODO: parameterize or state-ify this
 	host := hostKey[:len(hostKey)-1]
 
-	if isDirectIPDial := (dstIP != "" && host == dstIP); isDirectIPDial {
-		return d.directIPDial(ctx, tlsConf, scheme, hostKey, network, address, port, dialTimeout)
-	}
-
 	if dstIP != "" {
+		// if this is a direct IP dial, then we can skip the DNS resolution and round-robin queue management
+		if host == dstIP {
+			return d.directIPDial(ctx, tlsConf, scheme, hostKey, network, address, port, dialTimeout)
+		}
+
 		// attempting to connect to a specific IP address
 		conn, err := d.dialer.DialTimeout(network, net.JoinHostPort(dstIP, address[joinCharIndex+1:]), dialTimeout)
 		createdAt := time.Now()
@@ -662,6 +720,43 @@ func (d *roundRobinConnector) syncDNSAndDial(ctx context.Context, tlsConf *tls.C
 				conn.Close()
 			}
 		}()
+
+		if c, ok := conn.(keepAliveObserver); ok {
+
+			// TODO: If the Deadlines need to be set differently than the system defaults,
+			// it can and should be done here on connection creation - right now they do not.
+
+			err := c.SetKeepAliveConfig(net.KeepAliveConfig{
+				// If Enable is true, keep-alive probes are enabled.
+				Enable: true,
+
+				// Idle is the time that the connection must be idle before
+				// the first keep-alive probe is sent.
+				// If zero, a default value of 15 seconds is used.
+				//
+				// recommend 30–60s to detect dead peer in a minute or less
+				Idle: 30 * time.Second,
+
+				// Interval is the time between keep-alive probes.
+				// If zero, a default value of 15 seconds is used.
+				//
+				// recommend 5–10s to detect dead peer in a minute or less
+				// and retry keepalive frequently
+				Interval: 5 * time.Second,
+
+				// Count is the maximum number of keep-alive probes that
+				// can go unanswered before dropping a connection.
+				// If zero, a default value of 9 is used.
+				//
+				// recommended 3–5 to fail fast but tolerate some packet loss
+				Count: 3,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("failed to set keep-alive config on connection: %w", err)
+			}
+		} else {
+			return nil, fmt.Errorf("connection does not support SetKeepAliveConfig: %T", conn)
+		}
 
 		slog.LogAttrs(ctx, slog.LevelDebug,
 			"new connection",
